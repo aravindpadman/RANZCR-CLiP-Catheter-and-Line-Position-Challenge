@@ -6,6 +6,7 @@ import math
 import glob
 import ast
 import random
+from albumentations.augmentations.transforms import Resize
 
 import matplotlib.pyplot as plt 
 import numpy as np
@@ -15,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+import torchvision.transforms.functional as TF
 
 import PIL
 import cv2
@@ -25,10 +27,17 @@ from matplotlib_venn import venn2, venn3, venn3_circles
 
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 
+import cv2
+import albumentations as A
+# %%
+# parameters 
+HEIGHT = 256
+WIDTH = 256
+
 
 
 # %%
-data_dir = "../ranzcr-clip-catheter-line-classification/"
+data_dir = "/home/welcome/github/RANZCR-CLiP-Catheter-and-Line-Position-Challenge/ranzcr-clip-catheter-line-classification/"
 
 path_train_dir= os.path.join(data_dir, 'train')
 path_test_dir= os.path.join(data_dir, 'test')
@@ -126,21 +135,107 @@ def set_seed(seed=0):
     
 
 # %%
-
+## Create folds here 
 def create_folds(n_folds=5):
     global train
     # shuffle dataset
-    train = train.sample(frac=1)
-    mskf = MultilabelStratifiedKFold(n_splits=n_folds, random_state=0)
+    train = train.sample(frac=1, random_state=0).reset_index(drop=True)
+    mskf = MultilabelStratifiedKFold(n_splits=n_folds, shuffle=False, random_state=None)
     X = train.loc[:, [i for i in train.columns if i not in target_cols]]
     y = train.loc[:, target_cols]
 
     train.loc[:, 'kfold'] = 0
     for tuple_val in enumerate(mskf.split(X, y)):
-        kfold, train_id, test_idx = tuple_val
-        # print(len(train_idx))
-        # print(len(test_idx))
-        # print(kfold)
-        train.loc[test_idx] = kfold
+        kfold, (train_id, test_idx) = tuple_val
+        train.loc[test_idx, 'kfold'] = kfold
+
+# TODO: move the below snipet if needed
+create_folds()
+create_folds_count = train.groupby('kfold').StudyInstanceUID.count()
+print(create_folds_count)
 
 # %%
+class Dataset(torch.utils.data.Dataset):
+  'Characterizes a dataset for PyTorch'
+  def __init__(self, list_IDs, labels, transform):
+        'Initialization'
+        self.labels = labels
+        self.list_IDs = list_IDs
+        self.transform = transform
+
+  def __len__(self):
+        'Denotes the total number of samples'
+        return len(self.list_IDs)
+
+  def __getitem__(self, index):
+        'Generates one sample of data'
+        # print(f"index = {index}")
+        # Select sample
+        study_instance_uid = self.list_IDs[index]
+        image_path = os.path.join(path_train_dir, f"{study_instance_uid}.jpg")
+        image = PIL.Image.open(image_path).convert('RGB')
+        # image = TF.to_tensor(image)
+        image = np.array(image)
+        x = torch.from_numpy(self.transform(image=image)["image"])
+        # x.unsqueeze_(0)
+        # print(x.shape)
+        # print(type(x))
+
+        # Load data and get label
+        y = torch.tensor(
+            self.labels.loc[self.labels.StudyInstanceUID == study_instance_uid,
+             target_cols].values)
+        y.squeeze_(0)
+
+        return x, y
+
+
+
+# CUDA for PyTorch
+use_cuda = torch.cuda.is_available()
+device = torch.device("cuda:0" if use_cuda else "cpu")
+torch.backends.cudnn.benchmark = True
+
+# Parameters
+params = {'batch_size': 64,
+          'shuffle': True,
+          'num_workers': 16}
+max_epochs = 1
+
+FOLD = 0
+
+# image augmentation
+transform_train = A.Compose([
+    A.Resize(height=HEIGHT, width=WIDTH),
+    A.HorizontalFlip(p=0.5),
+])
+
+transform_validation = A.Compose([
+    A.Resize(height=HEIGHT, width=WIDTH),
+])
+
+transform_test = A.Compose([
+    A.Resize(height=HEIGHT, width=WIDTH),
+])
+
+
+partition = dict()
+partition['train'] = train.loc[train.kfold != FOLD, 'StudyInstanceUID'].tolist()
+partition['validation'] = train.loc[train.kfold == FOLD, 'StudyInstanceUID'].tolist()
+labels = train
+
+
+# Generators
+training_set = Dataset(partition['train'], labels, transform_train)
+training_generator = torch.utils.data.DataLoader(training_set, **params)
+
+validation_set = Dataset(partition['validation'], labels, transform_validation)
+validation_generator = torch.utils.data.DataLoader(validation_set, **params)
+
+for local_batch, local_labels in training_generator:
+    # Transfer to GPU
+    print(f"batch size = {local_batch.size()}")
+    print(f"batch label size= {local_labels.size()}")
+    break
+# %%
+
