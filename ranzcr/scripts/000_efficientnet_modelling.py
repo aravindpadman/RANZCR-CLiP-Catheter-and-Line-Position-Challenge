@@ -50,12 +50,15 @@ warnings.filterwarnings("ignore")
 from tqdm import tqdm_notebook as tqdm
 from tqdm import tqdm
 
-from torch.utils.tensorboard import SummaryWriter
-# %%
-writer = SummaryWriter('runs/exp_000') 
+import argparse
+
+import neptune
 
 # In[9]:
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--fold", required=True, type=int)
+args = vars(parser.parse_args())
 
 ## Parameters
 HEIGHT = 224
@@ -66,11 +69,13 @@ PIL.ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 IMAGE_BACKEND = 'pil'
 
-FOLD = 0
+FOLD = args['fold']
 
 
 # In[10]:
-
+# initialize neptune
+neptune.init(project_qualified_name='aravind/kaggle-ranzcr')
+neptune.create_experiment(f"000_001_fold_{FOLD}")
 
 # set seed
 def set_seed(seed=0):
@@ -82,38 +87,6 @@ def set_seed(seed=0):
     torch.backends.cudnn.deterministic = True
     
 set_seed()
-
-
-# In[11]:
-
-
-# path related variable
-data_dir = "/home/welcome/github/ranzcr/ranzcr-clip-catheter-line-classification/"
-# checkpoint directory path
-path_checkpoints_dir = "/home/welcome/github/ranzcr/checkpoints"
-# submissions directory path
-path_submissions_dir = "/home/welcome/github/ranzcr/submissions"
-
-
-path_train_dir= os.path.join(data_dir, 'train')
-path_test_dir= os.path.join(data_dir, 'test')
-path_train_csv= os.path.join(data_dir, 'train.csv')
-path_train_annotations= os.path.join(data_dir, 'train_annotations.csv')
-path_sample_submission_file= os.path.join(data_dir, 'sample_submission.csv')
-
-path_train_images = glob.glob(os.path.join(path_train_dir, "*.jpg"))
-path_test_images = glob.glob(os.path.join(path_test_dir, "*.jpg"))
-
-# Load data
-train_annotations = pd.read_csv(path_train_annotations)
-train = pd.read_csv(path_train_csv)
-target_cols = [i for i in train.columns if i not in ['StudyInstanceUID', 'PatientID']]
-
-# basic info about data
-print(f"number of patients in train csv= {train.PatientID.nunique()}")
-print(f"number of study instance id in train csv= {train.StudyInstanceUID.nunique()}")
-print(f"number of study instance id train_annotations= {train_annotations.StudyInstanceUID.nunique()}")
-
 
 # In[12]:
 
@@ -185,8 +158,7 @@ class ImageDataset:
             targets = self.targets[item]
             targets = torch.tensor(targets)
         else: 
-            # targets = torch.tensor([])
-            targets = None
+            targets = torch.tensor([])
             
         return {
             "image": image,
@@ -239,6 +211,10 @@ test_augmentation = A.Compose([
 
 # path related variable
 data_dir = "/home/welcome/github/ranzcr/ranzcr-clip-catheter-line-classification/"
+# path checkpoint
+path_checkpoints_dir = "/home/welcome/github/ranzcr/checkpoints"
+# submission files
+path_submissions_dir = "/home/welcome/github/ranzcr/submissions"
 
 path_train_dir= os.path.join(data_dir, 'train')
 path_test_dir= os.path.join(data_dir, 'test')
@@ -274,10 +250,16 @@ def create_folds(n_folds=5):
         train.loc[test_idx, 'kfold'] = kfold
     return train
 
-train = create_folds()
+if os.path.isfile('./train_folds.csv'):
+    train = pd.read_csv('./train_folds.csv')
+    print("train folds csv read from disk")
+else:
+    train = create_folds()
+    train.to_csv('./train_folds.csv', index=False)
+    print("train folds csv saved to disk for reuse")
+
 create_folds_count = train.groupby('kfold').StudyInstanceUID.count()
 print(create_folds_count)
-
 
 valid = train.loc[train.kfold == FOLD].reset_index(drop=True)
 train = train.loc[train.kfold != FOLD].reset_index(drop=True)
@@ -340,24 +322,6 @@ test_dataset = ImageDataset(
     grayscale_as_rgb=True,
 )
 
-# train_generator = torch.utils.data.DataLoader(train_dataset, **dataset_params)
-# valid_generator = torch.utils.data.DataLoader(valid_dataset, **dataset_params)
-# test_generator = torch.utils.data.DataLoader(test_dataset, **dataset_params)
-
-
-# In[16]:
-
-
-# for batch in train_generator:
-#     print(batch['image'].size(), batch['targets'].size())
-#     break
-# for batch in valid_generator:
-#     print(batch['image'].size(), batch['targets'].size())
-#     break
-# for batch in test_generator:
-#     print(batch['image'].size(), batch['targets'].size())
-#     break
-# 
 
 # In[31]:
 
@@ -385,7 +349,7 @@ class EfficientNetModel(torch.nn.Module):
     def __init__(self, num_labels=11):
         super().__init__()
         self.num_labels = num_labels
-        self.backbone = EfficientNet.from_pretrained("efficientnet-b5")
+        self.backbone = EfficientNet.from_pretrained("efficientnet-b5",)
         self.dropout = torch.nn.Dropout(p=0.5)
         self.avgpool = torch.nn.AdaptiveAvgPool2d(1)
         self.fc = torch.nn.Linear(2048, num_labels)
@@ -397,7 +361,7 @@ class EfficientNetModel(torch.nn.Module):
         image = self.dropout(image)
         image = self.fc(image)
         loss = None
-        if targets is not None:
+        if targets is not None and targets.size(1) == self.num_labels:
             loss = torch.nn.BCEWithLogitsLoss()(image, targets.type_as(image))
 
         with torch.no_grad():
@@ -506,6 +470,7 @@ class Trainer:
                         pass
                         # step_metric = self.name_to_metric(self.step_scheduler_metric)
                         # self.scheduler.step(step_metric)
+        neptune.log_metric("train_batch_loss", loss)
         return output, loss
         
     def train_one_epoch(self, dataloader):
@@ -528,10 +493,13 @@ class Trainer:
         avg_loss = np.array(all_losses).mean()
         self.metrics['train'].append({'epoch': self.current_epoch, 
         'avg_loss': avg_loss, 'auc_score': avg_auc})
+        neptune.log_metric("train_epoch_loss", avg_loss)
+        neptune.log_metric("train_epoch_auc", avg_auc)
         print(self.metrics['train'][self.current_epoch -1])
     
     def validate_one_batch(self, data):
         output, loss = self.model_forward_pass(data)
+        # neptune.log_metric("valid_batch_loss", loss)
         return output, loss
  
 
@@ -554,7 +522,9 @@ class Trainer:
         avg_loss = np.array(all_losses).mean()
         self.metrics['valid'].append({'epoch': self.current_epoch, 
         'avg_loss': avg_loss, 'auc_score': avg_auc})
-        print(self.metrics['valid'][self.current_epoch -1])
+        neptune.log_metric("valid_epoch_loss", avg_loss)
+        neptune.log_metric("valid_epoch_auc", avg_auc)
+        print(self.metrics['valid'][-1])
     
     def early_stoping(self):
         """early stoping function"""
@@ -608,6 +578,7 @@ class Trainer:
         checkpoint = torch.load(model_path)
         if self.model:
             self.model.load_state_dict(checkpoint['state_dict'])
+            self.model.to(self.device)
         if self.optimizer:
             self.optimizer.load_state_dict(checkpoint['optimizer'])
         if self.scheduler:
@@ -628,14 +599,22 @@ class Trainer:
         self.device = device
         self.test_batch_size = test_batch_size
         if load:
-            self.load(model_path, device=self.device)
+            if model_path:
+                self.load(model_path, device=self.device)
+            else:
+                model_path = os.path.join(path_checkpoints_dir, f"{self.experiment_id}.pth")
+                print(f"loaded model={model_path}")
+                self.load(model_path, device=self.device)
         if self.model is None:
             raise Exception("model cannot be None. Load or train the model before inference")
         dataloader = self.data_module.get_test_dataloader(batch_size=self.test_batch_size, shuffle=False, num_workers=dataloader_num_workers)
         all_outputs = []
         tk0 = tqdm(enumerate(dataloader, 1), total=len(dataloader))
         for batch_id, data in tk0:
-            batch_outputs, batch_loss= self.validate_one_batch(data)
+            # batch_outputs, batch_loss= self.validate_one_batch(data)
+            for key, value in data.items():
+                data[key] = value.to(self.device)
+            batch_outputs, batch_loss = self.model(**data)
             all_outputs.append(batch_outputs.detach().cpu().numpy())
         predictions = np.concatenate(all_outputs, axis=0)
         submission = pd.read_csv(path_sample_submission_file)
@@ -645,7 +624,6 @@ class Trainer:
             os.mkdir(path_submissions_dir)
         submission.to_csv(os.path.join(path_submissions_dir, f"{self.experiment_id}.csv"), index=False)
         tk0.close()
-
 
     def fit(self,
             n_epochs=100, 
@@ -674,7 +652,6 @@ class Trainer:
         self.validation_batch_size = validation_batch_size
         self.configure_trainer()
         # self.set_params(**kwargs)
-        global writer
         for i in range(1, self.n_epochs+1):
             self.current_epoch = i
             # train
@@ -692,29 +669,15 @@ class Trainer:
                 pin_memory=True
             )
             self.validate_one_epoch(validation_dataloader)
-            # add training and validation loss and auc
-            writer.add_scalars(
-                "train_vs_validation_loss",
-                {'train': self.metrics['train'][i-1]['avg_loss'],
-                'validation': self.metrics['valid'][i-1]['avg_loss']},
-                i,
-            )
-            writer.add_scalars(
-                "train_vs_validation_auc",
-                {'train': self.metrics['train'][i-1]['auc_score'],
-                'validation': self.metrics['valid'][i-1]['auc_score']},
-                i,
-            )
             es_flag = self.early_stoping()
             if es_flag:
                 print(f"early stopping at epoch={i} out of {n_epochs}")
                 break
-        writer.close()
 
 if __name__ == '__main__':
     """do some tests here"""
     model = EfficientNetModel()
     data_module = DataModule(train_dataset, valid_dataset, test_dataset)
     trainer = Trainer(model, data_module, f"000_001_{FOLD}")
-    # trainer.fit(fp16=True, tensorboard_writer=None)
-    trainer.predict(load=True)
+    trainer.fit(fp16=True, validation_batch_size=32)
+    # trainer.predict(load=True)
