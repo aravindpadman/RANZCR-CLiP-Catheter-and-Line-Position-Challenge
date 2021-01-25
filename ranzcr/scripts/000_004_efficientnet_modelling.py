@@ -1,11 +1,9 @@
 #!/usr/bin/env python
 # coding: utf-8
-"""investigate the effect of data augmentation on model performance"""
-# TODO: compute and integrate kfold cv score into the experimentation pipeline
-# TODO: Test scheduler. plot the optimizer and scheduler learning rate
-# TODO: implement 2xTTA 
-# TODO: it tooks 18 epochs to train the augmented model with CosineAnnealingLR.
-# this is too much. Need to speed up the learning. Try CosineAnneallingWarmStart?
+"""investigate the effect of data augmentation with adam optimizer without lr scheduler on model performance"""
+# NOTE: data augmentation with cosine annealing with warm restart reduced the leaderboard score to 0.914
+# TODO: resize shouldn't be part of data augmentation because its is time consuming. So write a multiprocessing script for image resizing
+# Investigate data augmentation with Adam optimizer without learning rate scheduling gives any good result
 
 import os
 import sys
@@ -42,11 +40,10 @@ from albumentations.pytorch import ToTensorV2
 
 import warnings
 warnings.filterwarnings("ignore")
-# In[9]:
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--fold", required=True, type=int)
-args = vars(parser.parse_args())
+from multiprocessing import Pool
+from joblib import Parallel, delayed
+# In[9]:
 
 ## Parameters
 HEIGHT = 224
@@ -57,18 +54,6 @@ PIL.ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 IMAGE_BACKEND = 'cv2'
 
-FOLD = args['fold']
-
-experiment_tag = "000_003"
-experiment_id = f"{experiment_tag}_{FOLD}"
-
-# In[10]:
-# initialize neptune
-neptune.init(project_qualified_name='aravind/kaggle-ranzcr')
-neptune.create_experiment(f"{experiment_id}")
-neptune.append_tag(experiment_tag)
-
-# set seed
 def set_seed(seed=0):
     random.seed(seed)
     np.random.seed(seed)
@@ -80,6 +65,21 @@ def set_seed(seed=0):
 set_seed()
 
 # In[12]:
+def resize_one_image(input_path, output_path, image_size):
+    image = cv2.imread(input_path)
+    image = cv2.resize(image, image_size)
+    cv2.imwrite(output_path, image)
+
+def resize_image_batch(input_dir, output_dir, image_size):
+    """multiprocessing image resize function"""
+    if not os.path.isdir(output_dir):
+        os.mkdir(output_dir)
+    input_paths = [os.path.join(input_dir, image_name) for image_name in os.listdir(input_dir)]
+    output_paths = [os.path.join(output_dir, image_name) for image_name in os.listdir(input_dir)]
+    image_sizes = [image_size]*len(input_paths)
+    
+    _ = Parallel(n_jobs=-1, verbose=10)(delayed(resize_one_image)(ipath, opath, img_size) for ipath, opath, img_size in zip(input_paths, output_paths, image_sizes))
+    
 
 
 class ImageDataset:
@@ -157,63 +157,6 @@ class ImageDataset:
         }
 
 
-# In[13]:
-
-
-# image augmentation 
-
-# train_augmentation = A.Compose([
-#     A.Resize(height=IMAGE_SIZE[0], width=IMAGE_SIZE[1]),
-#     A.HorizontalFlip(p=0.5),
-#     A.Normalize(
-#         mean=(0.485, 0.456, 0.406), 
-#         std=(0.229, 0.224, 0.225), 
-#         max_pixel_value=255.0, 
-#         always_apply=True,
-#         ),
-#     ToTensorV2(),
-#     ])
-
-train_augmentation = A.Compose([
-        A.RandomResizedCrop(height=IMAGE_SIZE[0], width=IMAGE_SIZE[1]),
-        A.HorizontalFlip(p=0.5),
-        A.ShiftScaleRotate(p=0.5),
-        A.OneOf([A.JpegCompression(), A.Downscale(scale_min=0.1, scale_max=0.15)], p=0.2),
-        A.HueSaturationValue(hue_shift_limit=0.2, sat_shift_limit=0.2, val_shift_limit=0.2, p=0.5),
-        A.RandomBrightnessContrast(brightness_limit=(-0.1,0.1), contrast_limit=(-0.1, 0.1), p=0.5),                          
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], max_pixel_value=255.0, p=1.0),
-        A.CoarseDropout(p=0.5),
-        A.Cutout(p=0.5),
-        ToTensorV2(p=1.0),
-        ]
-    )
-
-
-valid_augmentation = A.Compose([
-    A.Resize(height=IMAGE_SIZE[0], width=IMAGE_SIZE[1]),
-    A.Normalize(
-        mean=(0.485, 0.456, 0.406), 
-        std=(0.229, 0.224, 0.225), 
-        max_pixel_value=255.0, 
-        always_apply=True,
-        ),
-    ToTensorV2(),
-    ])
-
-test_augmentation = A.Compose([
-    A.Resize(height=IMAGE_SIZE[0], width=IMAGE_SIZE[1]),
-    A.Normalize(
-        mean=(0.485, 0.456, 0.406), 
-        std=(0.229, 0.224, 0.225), 
-        max_pixel_value=255.0, 
-        always_apply=True,
-        ),
-    ToTensorV2(),
-    ])
-
-
-# In[14]:
-
 
 # path related variable
 data_dir = "/home/welcome/github/ranzcr/ranzcr-clip-catheter-line-classification/"
@@ -223,6 +166,12 @@ path_checkpoints_dir = "/home/welcome/github/ranzcr/checkpoints"
 path_submissions_dir = "/home/welcome/github/ranzcr/submissions"
 # train folds file path
 path_train_folds_dir = "/home/welcome/github/ranzcr/train_folds"
+# resized image dir
+path_resized_train_image_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train_resized")
+print(path_resized_train_image_dir)
+# test image resized
+path_resized_test_image_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_resized")
+print(path_resized_test_image_dir)
 
 path_train_dir= os.path.join(data_dir, 'train')
 path_test_dir= os.path.join(data_dir, 'test')
@@ -254,71 +203,6 @@ def create_folds(n_folds=5):
         kfold, (train_id, test_idx) = tuple_val
         train.loc[test_idx, 'kfold'] = kfold
     return train
-
-if os.path.isfile(os.path.join(path_train_folds_dir, 'train_folds.csv')):
-    train = pd.read_csv(os.path.join(path_train_folds_dir, 'train_folds.csv'))
-    print("train folds csv read from disk")
-else:
-    train = create_folds()
-    train.to_csv(os.path.join(path_train_folds_dir, 'train_folds.csv'), index=False)
-    print("train folds csv saved to disk for reuse")
-
-create_folds_count = train.groupby('kfold').StudyInstanceUID.count()
-print(create_folds_count)
-
-valid = train.loc[train.kfold == FOLD].reset_index(drop=True)
-train = train.loc[train.kfold != FOLD].reset_index(drop=True)
-
-# image path for torch dataset
-path_train_images = [os.path.join(path_train_dir, i + ".jpg") for i in train.StudyInstanceUID.values]
-path_valid_images = [os.path.join(path_train_dir, i + ".jpg") for i in valid.StudyInstanceUID.values]
-# test images in the order of submission file
-submission_file = pd.read_csv(path_sample_submission_file)
-path_test_images = [os.path.join(path_test_dir, i + ".jpg") for i in submission_file.StudyInstanceUID.values]
-
-# targets values for torch dataset
-targets_train = train[target_cols].values
-targets_valid = valid[target_cols].values
-
-print(f"number of train images={len(path_train_images)}")
-print(f"number of validation images={len(path_valid_images)}")
-
-print(f"train data size={train.shape}")
-print(f"valid data size={valid.shape}")
-
-
-# In[15]:
-# inititialize dataset and dataloader 
-
-train_dataset = ImageDataset(
-    path_train_images,  
-    targets_train,  
-    augmentations=train_augmentation,  
-    backend=IMAGE_BACKEND,  
-    channel_first=True,  
-    grayscale=True,  
-    grayscale_as_rgb=True,
-)
-
-valid_dataset = ImageDataset(
-    path_valid_images,  
-    targets_valid,  
-    augmentations=valid_augmentation,  
-    backend=IMAGE_BACKEND,  
-    channel_first=True,  
-    grayscale=True,  
-    grayscale_as_rgb=True,
-)
-
-test_dataset = ImageDataset(
-    path_test_images,  
-    None,  
-    augmentations=test_augmentation,  
-    backend=IMAGE_BACKEND,  
-    channel_first=True,  
-    grayscale=True,  
-    grayscale_as_rgb=True,
-)
 
 
 # In[31]:
@@ -643,7 +527,7 @@ class Trainer:
 
     def fit(self,
             n_epochs=100, 
-            lr=1e-3, 
+            lr=1e-4, 
             step_scheduler_after='epoch', 
             step_scheduler_metric='val_auc',
             device='cuda', 
@@ -654,7 +538,7 @@ class Trainer:
             dataloader_num_workers=4,
             tensorboard_writer = None,
             es_delta=1e-4,
-            es_patience=3,
+            es_patience=5,
            ):
         """fit method to train the model"""
         self.n_epochs = n_epochs
@@ -701,6 +585,117 @@ class Trainer:
                 print(f"early stopping at epoch={i} out of {n_epochs}")
                 break
 
+def run(fold, resize=False, **kwargs):
+    """train single fold classifier"""
+    experiment_tag = "000_004_test"
+    experiment_id = f"{experiment_tag}_{fold}"
+    # initialize Neptune
+    neptune.init(project_qualified_name='aravind/kaggle-ranzcr')
+    neptune.create_experiment(f"{experiment_id}")
+    neptune.append_tag(experiment_tag)
+
+    if os.path.isfile(os.path.join(path_train_folds_dir, 'train_folds.csv')):
+        train = pd.read_csv(os.path.join(path_train_folds_dir, 'train_folds.csv'))
+        print("train folds csv read from disk")
+    else:
+        train = create_folds()
+        train.to_csv(os.path.join(path_train_folds_dir, 'train_folds.csv'), index=False)
+        print("train folds csv saved to disk for reuse")
+
+    create_folds_count = train.groupby('kfold').StudyInstanceUID.count()
+    print(create_folds_count)
+
+    if resize:
+        resize_image_batch(path_train_dir, path_resized_train_image_dir, IMAGE_SIZE)
+
+    valid = train.loc[train.kfold == fold].reset_index(drop=True)
+    train = train.loc[train.kfold != fold].reset_index(drop=True)
+
+    # image path for torch dataset
+    path_train_images = [os.path.join(path_resized_train_image_dir, i + ".jpg") for i in train.StudyInstanceUID.values]
+    path_valid_images = [os.path.join(path_resized_train_image_dir, i + ".jpg") for i in valid.StudyInstanceUID.values]
+    # test images in the order of submission file
+    submission_file = pd.read_csv(path_sample_submission_file)
+    path_test_images = [os.path.join(path_resized_test_image_dir, i + ".jpg") for i in submission_file.StudyInstanceUID.values]
+
+    # targets values for torch dataset
+    targets_train = train[target_cols].values
+    targets_valid = valid[target_cols].values
+
+    print(f"number of train images={len(path_train_images)}")
+    print(f"number of validation images={len(path_valid_images)}")
+    print(f"train data size={train.shape}")
+    print(f"valid data size={valid.shape}")
+
+    train_augmentation = A.Compose([
+            A.HorizontalFlip(p=0.5),
+            A.ShiftScaleRotate(p=0.5),
+            A.OneOf([A.JpegCompression(), A.Downscale(scale_min=0.1, scale_max=0.15)], p=0.2),
+            A.HueSaturationValue(hue_shift_limit=0.2, sat_shift_limit=0.2, val_shift_limit=0.2, p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=(-0.1,0.1), contrast_limit=(-0.1, 0.1), p=0.5),                          
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], max_pixel_value=255.0, p=1.0),
+            A.CoarseDropout(p=0.5),
+            A.Cutout(p=0.5),
+            ToTensorV2(p=1.0),
+            ]
+        )
+
+
+    valid_augmentation = A.Compose([
+        A.Normalize(
+            mean=(0.485, 0.456, 0.406), 
+            std=(0.229, 0.224, 0.225), 
+            max_pixel_value=255.0, 
+            always_apply=True,
+            ),
+        ToTensorV2(),
+        ])
+
+    test_augmentation = A.Compose([
+        A.Normalize(
+            mean=(0.485, 0.456, 0.406), 
+            std=(0.229, 0.224, 0.225), 
+            max_pixel_value=255.0, 
+            always_apply=True,
+            ),
+        ToTensorV2(),
+        ])
+
+    train_dataset = ImageDataset(
+        path_train_images,  
+        targets_train,  
+        augmentations=train_augmentation,  
+        backend=IMAGE_BACKEND,  
+        channel_first=True,  
+        grayscale=True,  
+        grayscale_as_rgb=True,
+    )
+
+    valid_dataset = ImageDataset(
+        path_valid_images,  
+        targets_valid,  
+        augmentations=valid_augmentation,  
+        backend=IMAGE_BACKEND,  
+        channel_first=True,  
+        grayscale=True,  
+        grayscale_as_rgb=True,
+    )
+
+    test_dataset = ImageDataset(
+        path_test_images,  
+        None,  
+        augmentations=test_augmentation,  
+        backend=IMAGE_BACKEND,  
+        channel_first=True,  
+        grayscale=True,  
+        grayscale_as_rgb=True,
+    )
+
+    model = EfficientNetModel(pretrained=True)
+    data_module = DataModule(train_dataset, valid_dataset, test_dataset)
+    trainer = Trainer(model, data_module, f"{experiment_id}")
+    trainer.fit(**kwargs)
+
 def ensemble_models(model_paths, output_file, model_tag):
     """combine different models to create the ensemble"""
     model = EfficientNetModel(pretrained=False)
@@ -731,14 +726,11 @@ def ensemble_models(model_paths, output_file, model_tag):
 
 if __name__ == '__main__':
     """do some tests here"""
-    model = EfficientNetModel(pretrained=True)
-    data_module = DataModule(train_dataset, valid_dataset, test_dataset)
-    trainer = Trainer(model, data_module, f"{experiment_id}")
-    trainer.fit(fp16=True, validation_batch_size=64, step_scheduler_metric=None)
     # trainer.predict(load=True)
     # model_paths = os.listdir(path_checkpoints_dir,)
     # model_paths = [os.path.join(path_checkpoints_dir, mpath) for mpath in model_paths]
     # ensemble_models(model_paths, "000_002_all_folds.csv")
     # print("done")
+    run(0, True, fp16=True, train_batch_size=128, validation_batch_size=128)
 
     
