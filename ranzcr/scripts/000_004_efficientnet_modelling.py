@@ -4,6 +4,7 @@
 # NOTE: data augmentation with cosine annealing with warm restart reduced the leaderboard score to 0.914
 # TODO: resize shouldn't be part of data augmentation because its is time consuming. So write a multiprocessing script for image resizing
 # Investigate data augmentation with Adam optimizer without learning rate scheduling gives any good result
+# TODO: add model parameters to Neptune
 
 import os
 import sys
@@ -78,7 +79,7 @@ def resize_image_batch(input_dir, output_dir, image_size):
     output_paths = [os.path.join(output_dir, image_name) for image_name in os.listdir(input_dir)]
     image_sizes = [image_size]*len(input_paths)
     
-    _ = Parallel(n_jobs=-1, verbose=10)(delayed(resize_one_image)(ipath, opath, img_size) for ipath, opath, img_size in zip(input_paths, output_paths, image_sizes))
+    _ = Parallel(n_jobs=-1, verbose=3)(delayed(resize_one_image)(ipath, opath, img_size) for ipath, opath, img_size in zip(input_paths, output_paths, image_sizes))
     
 
 
@@ -302,6 +303,7 @@ class Trainer:
     def configure_schedulers(self, **kwargs):
         if self.optimizer:
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, eta_min=1e-6, T_0=4)
+            self.scheduler = None
         else:
             raise Exception("optimizer cannot be None type: code fix required")
         
@@ -361,7 +363,8 @@ class Trainer:
                         # self.scheduler.step(step_metric)
         neptune.log_metric("train_batch_loss", loss)
         neptune.log_metric("optimizer_batch_lr", self.optimizer.param_groups[0]['lr'])
-        neptune.log_metric("scheduler_batch_lr", self.scheduler.get_last_lr()[0])
+        if self.scheduler:
+            neptune.log_metric("scheduler_batch_lr", self.scheduler.get_last_lr()[0])
         return output, loss
         
     def train_one_epoch(self, dataloader):
@@ -572,13 +575,14 @@ class Trainer:
                 pin_memory=True
             )
             self.validate_one_epoch(validation_dataloader)
-            if self.step_scheduler_after == 'epoch': 
-                if self.step_scheduler_metric == 'val_auc':
-                    neptune.log_metric('scheduler_epoch_lr', self.scheduler.get_last_lr()[0])
-                    self.scheduler.step(self.metrics['valid'][-1]['auc_score'])
-                else:
-                    neptune.log_metric('scheduler_epoch_lr', self.scheduler.get_last_lr()[0])
-                    self.scheduler.step()
+            if self.scheduler:
+                if self.step_scheduler_after == 'epoch': 
+                    if self.step_scheduler_metric == 'val_auc':
+                        neptune.log_metric('scheduler_epoch_lr', self.scheduler.get_last_lr()[0])
+                        self.scheduler.step(self.metrics['valid'][-1]['auc_score'])
+                    else:
+                        neptune.log_metric('scheduler_epoch_lr', self.scheduler.get_last_lr()[0])
+                        self.scheduler.step()
 
             es_flag = self.early_stoping()
             if es_flag:
@@ -731,6 +735,12 @@ if __name__ == '__main__':
     # model_paths = [os.path.join(path_checkpoints_dir, mpath) for mpath in model_paths]
     # ensemble_models(model_paths, "000_002_all_folds.csv")
     # print("done")
-    run(0, True, fp16=True, train_batch_size=128, validation_batch_size=128)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fold", required=True, type=int)
+    parser.add_argument("--resize", required=False, type=bool, default=False)
+    args = vars(parser.parse_args())
+    fold = args['fold']
+    resize = args['resize']
+    run(fold, resize, fp16=True, train_batch_size=128, validation_batch_size=64, lr=1e-3)
 
     
