@@ -1,11 +1,10 @@
 #!/usr/bin/env python
 # coding: utf-8
-"""investigate the effect of data augmentation with Adam optimizer without lr scheduler on model performance"""
-# NOTE: 000_004 is not improving score much. 
-# TODO: perform the Learning Rate Range test and plot the result
+"""investigate the effect of data augmentation with adam optimizer without lr scheduler on model performance"""
+# NOTE: data augmentation with cosine annealing with warm restart reduced the leaderboard score to 0.914
+# TODO: resize shouldn't be part of data augmentation because its is time consuming. So write a multiprocessing script for image resizing
+# Investigate data augmentation with Adam optimizer without learning rate scheduling gives any good result
 # TODO: add model parameters to Neptune
-# NOTE: Params: efficientnet-b5, Adam, triangular lr policy with step_size=max_iter, and data augmentation
-# NOTE: So far there is not improvement in Leaderboard score due to Data Augmentation
 
 import os
 import sys
@@ -274,8 +273,7 @@ class Trainer:
         self.metrics['train'] = []
         self.metrics['valid'] = []
         self.current_epoch = 0
-        self.current_train_batch = 0
-        self.current_valid_batch = 0
+        self.current_batch = 0
         self.scaler = None
         # early stopping related variables
         self._best_score = -np.inf
@@ -285,11 +283,6 @@ class Trainer:
         self._patience = None
         # variable related to model checkpoints
         self.experiment_id = experiment_id
-        # scheduler variables
-        self.step_size = None
-        self.max_epoch = None
-        self.max_iter = None
-        self.num_iterations = None
         
     def configure_trainer(self):
         if self.optimizer is None:
@@ -304,12 +297,13 @@ class Trainer:
             self.scaler = torch.cuda.amp.GradScaler()
             
     def configure_optimizers(self):
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.base_lr)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
     
     def configure_schedulers(self, **kwargs):
         if self.optimizer:
-            # self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, eta_min=1e-6, T_0=4)
-            self.scheduler = torch.optim.lr_scheduler.CyclicLR(self.optimizer, base_lr=self.base_lr, max_lr=self.max_lr, step_size_up=self.step_size, cycle_momentum=False)
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, eta_min=3e-6, T_0=2*1004, T_mult=2)
+            # self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=1004*5, eta_min=3e-6)
+            # self.scheduler = None
         else:
             raise Exception("optimizer cannot be None type: code fix required")
         
@@ -347,8 +341,6 @@ class Trainer:
         
     
     def train_one_batch(self, data):
-        """train one batch"""
-        self.current_train_batch += 1
         self.optimizer.zero_grad()
         output, loss = self.model_forward_pass(data)
         with torch.set_grad_enabled(True):
@@ -363,8 +355,7 @@ class Trainer:
             if self.scheduler:
                 if self.step_scheduler_after == "batch":
                     if self.step_scheduler_metric is None:
-                        neptune.log_metric('scheduler_batch_learning_rate', self.scheduler.get_last_lr()[0])
-                        neptune.log_metric('LR_range_test_on_train_loss', self.scheduler.get_last_lr()[0], y=loss.detach())
+                        neptune.log_metric('batch_learning_rate', self.scheduler.get_last_lr()[0])
                         self.scheduler.step()
                     else:
                         pass
@@ -400,7 +391,7 @@ class Trainer:
         'avg_loss': avg_loss, 'auc_score': avg_auc})
         neptune.log_metric("train_epoch_loss", avg_loss)
         neptune.log_metric("train_epoch_auc", avg_auc)
-        print(self.metrics['train'][-1])
+        print(self.metrics['train'][self.current_epoch -1])
     
     def validate_one_batch(self, data):
         output, loss = self.model_forward_pass(data)
@@ -538,11 +529,8 @@ class Trainer:
         return predictions
 
     def fit(self,
-            base_lr,
-            max_lr,
-            step_epoch,
-            max_epoch,
             n_epochs=100, 
+            lr=1e-4, 
             step_scheduler_after='epoch', 
             step_scheduler_metric='val_auc',
             device='cuda', 
@@ -550,7 +538,7 @@ class Trainer:
             train_batch_size = 64,
             validation_batch_size=64,
             dataloader_shuffle=True,
-            dataloader_num_workers=5,
+            dataloader_num_workers=4,
             tensorboard_writer = None,
             es_delta=1e-4,
             es_patience=5,
@@ -561,17 +549,12 @@ class Trainer:
         self.step_scheduler_metric = step_scheduler_metric 
         self.device = device
         self.fp16 = fp16
+        self.lr = lr
         self._delta = es_delta
         self._patience = es_patience
+        # self.experiment_id = experiment_id
         self.train_batch_size = train_batch_size
         self.validation_batch_size = validation_batch_size
-        self.num_iterations = np.ceil(len(self.data_module.get_train_dataloader())/ self.train_batch_size)
-        print(f"number of batches in training={self.num_iterations}")
-        self.step_size = step_epoch*self.num_iterations
-        self.max_iter = self.num_iterations*max_epoch
-        self.base_lr = base_lr
-        self.max_lr = max_lr
-        self.max_epoch = max_epoch
         self.configure_trainer()
         # self.set_params(**kwargs)
         for i in range(1, self.n_epochs+1):
@@ -601,11 +584,8 @@ class Trainer:
                         neptune.log_metric('scheduler_epoch_lr', self.scheduler.get_last_lr()[0])
                         self.scheduler.step()
 
-            if self.current_train_batch >= self.max_iter:
-                print("reached maximum iterations, stopping training")
+            if self.current_epoch > 10 and math.abs(self.scheduler.get_last_lr()[0] - 3e-6) <= 5e-7:
                 break
-            
-            neptune.log_metric('LR_range_test_validation_auc', self.scheduler.get_last_lr()[0], y=self.metrics['valid'][-1]['auc_score'])
             # es_flag = self.early_stoping()
             # if es_flag:
             #     print(f"early stopping at epoch={i} out of {n_epochs}")
@@ -613,7 +593,7 @@ class Trainer:
 
 def run(fold, resize=False, **kwargs):
     """train single fold classifier"""
-    experiment_tag = "000_005_test"
+    experiment_tag = "000_007_adam_wr"
     experiment_id = f"{experiment_tag}_{fold}"
     # initialize Neptune
     neptune.init(project_qualified_name='aravind/kaggle-ranzcr')
@@ -654,17 +634,21 @@ def run(fold, resize=False, **kwargs):
     print(f"valid data size={valid.shape}")
 
     train_augmentation = A.Compose([
-            A.CLAHE(),
+            A.CLAHE(p=1),
             A.HorizontalFlip(p=0.5),
-            A.ShiftScaleRotate(p=0.5),
-            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], max_pixel_value=255.0, p=1.0),
+            A.ShiftScaleRotate(p=0.5, rotate_limit=90, scale_limit=0.2),
+            A.Normalize(mean=[0.485, 0.456, 0.406], 
+                std=[0.229, 0.224, 0.225], 
+                max_pixel_value=255.0, 
+                always_apply=True,
+                ),
             ToTensorV2(p=1.0),
             ]
         )
 
 
     valid_augmentation = A.Compose([
-            A.CLAHE(),
+        A.CLAHE(p=1),
         A.Normalize(
             mean=(0.485, 0.456, 0.406), 
             std=(0.229, 0.224, 0.225), 
@@ -675,7 +659,7 @@ def run(fold, resize=False, **kwargs):
         ])
 
     test_augmentation = A.Compose([
-            A.CLAHE(),
+        A.CLAHE(p=1),
         A.Normalize(
             mean=(0.485, 0.456, 0.406), 
             std=(0.229, 0.224, 0.225), 
@@ -715,13 +699,10 @@ def run(fold, resize=False, **kwargs):
         grayscale_as_rgb=True,
     )
 
-    base_lr = 1e-7 
-    max_lr = 1e-4 
-    max_epoch = 5
     model = EfficientNetModel(pretrained=True)
     data_module = DataModule(train_dataset, valid_dataset, test_dataset)
     trainer = Trainer(model, data_module, f"{experiment_id}")
-    trainer.fit(base_lr, max_lr, max_epoch, max_epoch, **kwargs)
+    trainer.fit(**kwargs)
 
 def ensemble_models(model_paths, output_file, model_tag):
     """combine different models to create the ensemble"""
@@ -764,6 +745,6 @@ if __name__ == '__main__':
     args = vars(parser.parse_args())
     fold = args['fold']
     resize = args['resize']
-    run(fold, resize, fp16=True, train_batch_size=24, validation_batch_size=16, step_scheduler_after='batch', step_scheduler_metric=None, )
+    run(fold, resize, fp16=True, train_batch_size=24, validation_batch_size=8, lr=1e-4, step_scheduler_after='batch', step_scheduler_metric=None)
 
     

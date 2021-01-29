@@ -48,8 +48,9 @@ from joblib import Parallel, delayed
 # In[9]:
 
 ## Parameters
+HEIGHT = 224
+WIDTH = 224
 IMAGE_SIZE = (224, 224)
-IMAGE_SIZE = (512, 512)
 
 PIL.ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -63,7 +64,7 @@ def set_seed(seed=0):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     
-set_seed()
+# set_seed()
 
 # In[12]:
 def resize_one_image(input_path, output_path, image_size):
@@ -364,7 +365,6 @@ class Trainer:
                 if self.step_scheduler_after == "batch":
                     if self.step_scheduler_metric is None:
                         neptune.log_metric('scheduler_batch_learning_rate', self.scheduler.get_last_lr()[0])
-                        neptune.log_metric('LR_range_test_on_train_loss', self.scheduler.get_last_lr()[0], y=loss.detach())
                         self.scheduler.step()
                     else:
                         pass
@@ -469,7 +469,9 @@ class Trainer:
         model_dict["scheduler"] = sch_state_dict
         model_dict["epoch"] = self.current_epoch
         model_dict["fp16"] = self.fp16
-        model_dict['lr'] = self.lr
+        model_dict['base_lr'] = self.base_lr
+        model_dict['max_lr'] = self.max_lr
+        model_dict['step_size'] = self.step_size
         model_dict['metrics'] = self.metrics
         model_dict['best_score'] = self._best_score
         model_dict['patience'] = self._patience
@@ -501,6 +503,9 @@ class Trainer:
         self.train_batch_size = checkpoint['train_batch_size']
         self.validation_batch_size = checkpoint['validation_batch_size']
         self.experiment_id = checkpoint['experiment_id']
+        self.base_lr = checkpoint['base_lr'] 
+        self.max_lr = checkpoint['max_lr'] 
+        self.step_size = checkpoint['step_size'] 
     
     def predict(self, test_batch_size=64, device='cuda', load=False, model_path=None, dataloader_num_workers=4, save_prediction=True):
         """make predictions on test images"""
@@ -604,16 +609,14 @@ class Trainer:
             if self.current_train_batch >= self.max_iter:
                 print("reached maximum iterations, stopping training")
                 break
-            
-            neptune.log_metric('LR_range_test_validation_auc', self.scheduler.get_last_lr()[0], y=self.metrics['valid'][-1]['auc_score'])
-            # es_flag = self.early_stoping()
-            # if es_flag:
-            #     print(f"early stopping at epoch={i} out of {n_epochs}")
-            #     break
+            es_flag = self.early_stoping()
+            if es_flag:
+                print(f"early stopping at epoch={i} out of {n_epochs}")
+                break
 
 def run(fold, resize=False, **kwargs):
     """train single fold classifier"""
-    experiment_tag = "000_005_test"
+    experiment_tag = "000_006"
     experiment_id = f"{experiment_tag}_{fold}"
     # initialize Neptune
     neptune.init(project_qualified_name='aravind/kaggle-ranzcr')
@@ -654,17 +657,20 @@ def run(fold, resize=False, **kwargs):
     print(f"valid data size={valid.shape}")
 
     train_augmentation = A.Compose([
-            A.CLAHE(),
             A.HorizontalFlip(p=0.5),
             A.ShiftScaleRotate(p=0.5),
+            A.OneOf([A.JpegCompression(), A.Downscale(scale_min=0.1, scale_max=0.15)], p=0.2),
+            A.HueSaturationValue(hue_shift_limit=0.2, sat_shift_limit=0.2, val_shift_limit=0.2, p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=(-0.1,0.1), contrast_limit=(-0.1, 0.1), p=0.5),                          
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], max_pixel_value=255.0, p=1.0),
+            A.CoarseDropout(p=0.5),
+            A.Cutout(p=0.5),
             ToTensorV2(p=1.0),
             ]
         )
 
 
     valid_augmentation = A.Compose([
-            A.CLAHE(),
         A.Normalize(
             mean=(0.485, 0.456, 0.406), 
             std=(0.229, 0.224, 0.225), 
@@ -675,7 +681,6 @@ def run(fold, resize=False, **kwargs):
         ])
 
     test_augmentation = A.Compose([
-            A.CLAHE(),
         A.Normalize(
             mean=(0.485, 0.456, 0.406), 
             std=(0.229, 0.224, 0.225), 
@@ -715,13 +720,14 @@ def run(fold, resize=False, **kwargs):
         grayscale_as_rgb=True,
     )
 
-    base_lr = 1e-7 
+    base_lr = 3e-5 
     max_lr = 1e-4 
-    max_epoch = 5
+    step_epoch = 3
+    max_epoch = 30
     model = EfficientNetModel(pretrained=True)
     data_module = DataModule(train_dataset, valid_dataset, test_dataset)
     trainer = Trainer(model, data_module, f"{experiment_id}")
-    trainer.fit(base_lr, max_lr, max_epoch, max_epoch, **kwargs)
+    trainer.fit(base_lr, max_lr, step_epoch, max_epoch, **kwargs)
 
 def ensemble_models(model_paths, output_file, model_tag):
     """combine different models to create the ensemble"""
@@ -764,6 +770,6 @@ if __name__ == '__main__':
     args = vars(parser.parse_args())
     fold = args['fold']
     resize = args['resize']
-    run(fold, resize, fp16=True, train_batch_size=24, validation_batch_size=16, step_scheduler_after='batch', step_scheduler_metric=None, )
+    run(fold, resize, fp16=True, train_batch_size=128, validation_batch_size=64, step_scheduler_after='batch', step_scheduler_metric=None, )
 
     
