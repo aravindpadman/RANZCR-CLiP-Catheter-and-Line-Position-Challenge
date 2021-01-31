@@ -1,10 +1,17 @@
-#!/usr/bin/env python
+# !/usr/bin/env python
 # coding: utf-8
 """investigate the effect of data augmentation with adam optimizer without lr scheduler on model performance"""
-# NOTE: data augmentation with cosine annealing with warm restart reduced the leaderboard score to 0.914
-# TODO: resize shouldn't be part of data augmentation because its is time consuming. So write a multiprocessing script for image resizing
-# Investigate data augmentation with Adam optimizer without learning rate scheduling gives any good result
-# TODO: add model parameters to Neptune
+# image size has increased to 512x512
+# TODO: add resuming logic
+# TODO: log model and training parameters to neptune
+# TODO: add gradient accumulation if needed
+# TODO: add extra tags to neptune to filter experiments fast
+# TODO: try out SGD optimizer and weight decay(L2 regularization)
+# TODO: log multilabel ROC curve to neptune
+# NEXT STEPS: may be in an another scripts 
+# experiment with SGD and try to reach an auc of 0.95
+# explore techniques to reproduce results in deep learning
+# How to combine label annotations
 
 import os
 import sys
@@ -44,10 +51,11 @@ warnings.filterwarnings("ignore")
 
 from multiprocessing import Pool
 from joblib import Parallel, delayed
+
+from enum import Enum
 # In[9]:
 
 ## Parameters
-IMAGE_SIZE = (224, 224)
 IMAGE_SIZE = (512, 512)
 
 PIL.ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -62,7 +70,7 @@ def set_seed(seed=0):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     
-set_seed()
+# set_seed()
 
 # In[12]:
 def resize_one_image(input_path, output_path, image_size):
@@ -79,7 +87,34 @@ def resize_image_batch(input_dir, output_dir, image_size):
     image_sizes = [image_size]*len(input_paths)
     
     _ = Parallel(n_jobs=-1, verbose=3)(delayed(resize_one_image)(ipath, opath, img_size) for ipath, opath, img_size in zip(input_paths, output_paths, image_sizes))
-    
+
+
+class ConfigEnum(Enum):
+    """define all parameters here"""
+    fp16 = True
+    grad_accumulation_steps = 1
+    image_size = 512
+    seed = 42
+    train_batch_size = 24
+    vaid_batch_size = 8
+    test_batch_size = 8
+    optimizer = "Adam"
+    lr = 1e-4 
+    base_lr = 3e-5
+    max_lr = 1e-4
+    weight_decay = 0.0
+    scheduler = "CosineAnnealingWarmRestarts"
+    step_scheduler_after = 'batch'
+    step_scheduler_metric = None
+    T_0 = 2
+    T_mult = 2
+    T_max = None
+    step_size = None 
+    compute_train_loss_after = 'batch'
+    compute_train_metric_after = 'epoch'
+    compute_valid_loss_after = 'batch'
+    compute_valid_metric_after = 'epoch'
+
 
 
 class ImageDataset:
@@ -273,7 +308,8 @@ class Trainer:
         self.metrics['train'] = []
         self.metrics['valid'] = []
         self.current_epoch = 0
-        self.current_batch = 0
+        self.current_train_batch = 0
+        self.current_valid_batch = 0
         self.scaler = None
         # early stopping related variables
         self._best_score = -np.inf
@@ -341,6 +377,7 @@ class Trainer:
         
     
     def train_one_batch(self, data):
+        self.current_train_batch += 1
         self.optimizer.zero_grad()
         output, loss = self.model_forward_pass(data)
         with torch.set_grad_enabled(True):
@@ -394,6 +431,7 @@ class Trainer:
         print(self.metrics['train'][self.current_epoch -1])
     
     def validate_one_batch(self, data):
+        self.current_valid_batch += 1
         output, loss = self.model_forward_pass(data)
         neptune.log_metric("valid_batch_loss", loss.detach().cpu())
         return output, loss
@@ -458,9 +496,12 @@ class Trainer:
         model_dict["state_dict"] = model_state_dict
         model_dict["optimizer"] = opt_state_dict
         model_dict["scheduler"] = sch_state_dict
-        model_dict["epoch"] = self.current_epoch
         model_dict["fp16"] = self.fp16
         model_dict['lr'] = self.lr
+        model_dict['current_epoch'] = self.current_epoch
+        model_dict['current_train_batch'] = self.current_train_batch
+        model_dict['step_scheduler_after'] = self.step_scheduler_after
+        model_dict['step_scheduler_metric'] = self.step_scheduler_metric
         model_dict['metrics'] = self.metrics
         model_dict['best_score'] = self._best_score
         model_dict['patience'] = self._patience
@@ -468,6 +509,7 @@ class Trainer:
         model_dict['train_batch_size'] = self.train_batch_size
         model_dict['validation_batch_size'] = self.validation_batch_size
         model_dict['experiment_id'] = self.experiment_id
+        model_dict['device'] = self.device
         torch.save(model_dict, model_path)
     
     def load(self, model_path, device=None):
@@ -584,21 +626,29 @@ class Trainer:
                         neptune.log_metric('scheduler_epoch_lr', self.scheduler.get_last_lr()[0])
                         self.scheduler.step()
 
-            if self.current_epoch > 10 and math.abs(self.scheduler.get_last_lr()[0] - 3e-6) <= 5e-7:
+            if self.current_epoch == 14:
+                self.save_checkpoint()
                 break
-            # es_flag = self.early_stoping()
+            es_flag = self.early_stoping()
             # if es_flag:
             #     print(f"early stopping at epoch={i} out of {n_epochs}")
             #     break
 
 def run(fold, resize=False, **kwargs):
     """train single fold classifier"""
-    experiment_tag = "000_007_adam_wr"
+    experiment_tag = "000_007_512_adam_wr"
     experiment_id = f"{experiment_tag}_{fold}"
+    # parameters
+    parameters = {}
+    for i in ConfigEnum:
+        parameters[i.name] = i.value
+    parameters['experiment_id'] = experiment_id
     # initialize Neptune
     neptune.init(project_qualified_name='aravind/kaggle-ranzcr')
-    neptune.create_experiment(f"{experiment_id}")
+    neptune.create_experiment(f"{experiment_id}", params=parameters)
     neptune.append_tag(experiment_tag)
+    neptune.append_tag(parameters['optimizer'])
+    neptune.append_tag(parameters['scheduler'])
 
     if os.path.isfile(os.path.join(path_train_folds_dir, 'train_folds.csv')):
         train = pd.read_csv(os.path.join(path_train_folds_dir, 'train_folds.csv'))
@@ -741,10 +791,14 @@ if __name__ == '__main__':
     # print("done")
     parser = argparse.ArgumentParser()
     parser.add_argument("--fold", required=True, type=int)
-    parser.add_argument("--resize", required=False, type=bool, default=False)
+    parser.add_argument("--resize", type=bool, required=False, default=False)
+    parser.add_argument("--sleep", type=bool, required=False, default=False)
     args = vars(parser.parse_args())
+    print(args)
     fold = args['fold']
     resize = args['resize']
+    sleep = args['sleep']
+    if sleep:
+        print("START SLEEP")
+        time.sleep(5*60)
     run(fold, resize, fp16=True, train_batch_size=24, validation_batch_size=8, lr=1e-4, step_scheduler_after='batch', step_scheduler_metric=None)
-
-    
