@@ -13,6 +13,7 @@
 # explore techniques to reproduce results in deep learning
 # How to combine label annotations
 
+from itertools import accumulate
 import os
 import sys
 import time
@@ -87,33 +88,6 @@ def resize_image_batch(input_dir, output_dir, image_size):
     image_sizes = [image_size]*len(input_paths)
     
     _ = Parallel(n_jobs=-1, verbose=3)(delayed(resize_one_image)(ipath, opath, img_size) for ipath, opath, img_size in zip(input_paths, output_paths, image_sizes))
-
-
-class ConfigEnum(Enum):
-    """define all parameters here"""
-    fp16 = True
-    grad_accumulation_steps = 1
-    image_size = 512
-    seed = 42
-    train_batch_size = 24
-    vaid_batch_size = 8
-    test_batch_size = 8
-    optimizer = "Adam"
-    lr = 1e-4 
-    base_lr = 3e-5
-    max_lr = 1e-4
-    weight_decay = 0.0
-    scheduler = "CosineAnnealingWarmRestarts"
-    step_scheduler_after = 'batch'
-    step_scheduler_metric = None
-    T_0 = 2
-    T_mult = 2
-    T_max = None
-    step_size = None 
-    compute_train_loss_after = 'batch'
-    compute_train_metric_after = 'epoch'
-    compute_valid_loss_after = 'batch'
-    compute_valid_metric_after = 'epoch'
 
 
 
@@ -294,16 +268,127 @@ class EfficientNetModel(torch.nn.Module):
 # In[64]:
 
 
+class ConfigEnum(Enum):
+    """define all parameters here"""
+    device='cuda'
+    fp16 = True
+    accumulate_grad_steps = 1
+    image_size = 512
+    seed = 42
+    train_batch_size = 24
+    valid_batch_size = 8
+    test_batch_size = 8
+    optimizer_type = "Adam"
+    lr = 1e-4 
+    base_lr = 3e-5
+    max_lr = 1e-4
+    weight_decay = 0.0
+    scheduler_type = "CosineAnnealingWarmRestarts"
+    step_scheduler_after = 'batch'
+    step_scheduler_metric = None
+    T_0 = 2
+    T_mult = 2
+    T_max = None
+    step_size = None 
+    compute_train_loss_after = 'batch'
+    compute_train_metric_after = 'epoch'
+    compute_valid_loss_after = 'batch'
+    compute_valid_metric_after = 'epoch'
+    # early stopping counter
+    es_patience = 5
+    es_delta = 1e-4
+    # training stoping criteria
+    training_stoping_criteria = 'max_epoch'
+    max_epoch = 14
+    train_dataloder_shuffle = True
+    dataloader_num_workers = 5
+
 class Trainer:
-    def __init__(self, model, data_module, experiment_id, optimizer=None, scheduler=None, device='cuda'):
+    def __init__(self, 
+    model, 
+    data_module, 
+    experiment_id, 
+    image_size=None,
+    device=None,
+    fp16=None,
+    accumulate_grad_steps=None,
+    seed=None,
+    train_batch_size=None,
+    valid_batch_size=None,
+    test_batch_size=None,
+    dataloader_num_workers=None,
+    train_dataloader_shuffle=None,
+    lr=None,
+    base_lr=None,
+    max_lr=None,
+    weight_decay=None,
+    optimizer_type=None,
+    scheduler_type=None, 
+    step_scheduler_after=None,
+    step_scheduler_metric=None,
+    compute_train_loss_after=None,
+    compute_train_metric_after=None,
+    compute_valid_loss_after=None,
+    compute_valid_metric_after=None,
+    training_stoping_criteria=None,
+    es_patience=None,
+    es_delta=None,
+    max_epoch=None,
+    T_0=None,
+    T_mult=None,
+    T_max=None,
+    step_size=None,
+    ):
         self.model = model
         self.data_module = data_module
-        self.optimizer = optimizer
-        self.scheduler = scheduler
+        self.experiment_id = experiment_id
+
+        self.image_size = image_size
         self.device = device
-        self.fp16 = False
-        self.step_scheduler_after = None
-        self.n_epochs = None
+        self.fp16 = fp16
+        self.accumulate_grad_steps = accumulate_grad_steps
+
+        self.seed = seed
+
+        self.train_batch_size = train_batch_size
+        self.valid_batch_size = valid_batch_size
+        self.test_batch_size = test_batch_size
+        self.dataloader_num_workers = dataloader_num_workers
+        self.train_dataloader_shuffle = train_dataloader_shuffle
+
+        self.lr = lr
+        self.basel_lr = base_lr
+        self.max_lr = max_lr
+
+        self.weight_decay = weight_decay
+
+        self.optimizer_type = optimizer_type
+        self.optimizer = None
+
+        self.scheduler_type = scheduler_type
+        self.scheduler = None
+        self.step_scheduler_after = step_scheduler_after
+        self.step_scheduler_metric = step_scheduler_metric
+
+        self.compute_train_loss_after = compute_train_loss_after
+        self.compute_train_metric_after = compute_train_metric_after
+        self.compute_valid_loss_after = compute_valid_loss_after
+        self.compute_valid_metric_after = compute_valid_metric_after
+
+        self.training_stoping_criteria = training_stoping_criteria
+        self.es_patience = es_patience
+        self.es_delta = es_delta
+        self.max_epoch = max_epoch
+        self._best_score = -np.inf
+        self._current_score = None
+        self._counter = 0
+
+        # scheduler related
+        self.T_0 = T_0
+        self.T_mult = T_mult
+        self.T_max = T_max
+        self.step_size = step_size
+
         self.metrics = {}
         self.metrics['train'] = []
         self.metrics['valid'] = []
@@ -311,20 +396,10 @@ class Trainer:
         self.current_train_batch = 0
         self.current_valid_batch = 0
         self.scaler = None
-        # early stopping related variables
-        self._best_score = -np.inf
-        self._delta = None
-        self._current_score = None
-        self._counter = 0
-        self._patience = None
-        # variable related to model checkpoints
-        self.experiment_id = experiment_id
         
     def configure_trainer(self):
-        if self.optimizer is None:
-            self.configure_optimizers()
-        if self.scheduler is None:
-            self.configure_schedulers()
+        self.configure_optimizers()
+        self.configure_schedulers()
         
         if next(self.model.parameters()).device != self.device:
             self.model.to(self.device)
@@ -333,15 +408,19 @@ class Trainer:
             self.scaler = torch.cuda.amp.GradScaler()
             
     def configure_optimizers(self):
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        if self.optimizer_type == 'Adam':
+            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        else:
+            raise Exception("No optimizer configured for training")
     
     def configure_schedulers(self, **kwargs):
-        if self.optimizer:
+        """configure different learning rate scheduler here"""
+        if self.scheduler_type == 'CosineAnnealingWarmRestarts':
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, eta_min=3e-6, T_0=2*1004, T_mult=2)
-            # self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=1004*5, eta_min=3e-6)
-            # self.scheduler = None
+        elif self.scheduler_type == 'CosineAnnealingLR':
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.T_max, eta_min=self.base_lr)
         else:
-            raise Exception("optimizer cannot be None type: code fix required")
+            self.scheduler = None
         
     def set_params(self, **kwargs):
         for parameter, value in kwargs.items():
@@ -372,13 +451,12 @@ class Trainer:
                 output, loss = self.model(**data)
         else:
             output, loss = self.model(**data)
-                
+
         return output, loss
         
     
     def train_one_batch(self, data):
         self.current_train_batch += 1
-        self.optimizer.zero_grad()
         output, loss = self.model_forward_pass(data)
         with torch.set_grad_enabled(True):
             if self.fp16:
@@ -388,7 +466,9 @@ class Trainer:
                     self.scaler.update()
             else:
                 loss.backward()
-                self.optimizer.step()
+                if (self.current_train_batch % self.accumulate_grad_steps) == 0:
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
             if self.scheduler:
                 if self.step_scheduler_after == "batch":
                     if self.step_scheduler_metric is None:
@@ -416,8 +496,6 @@ class Trainer:
             all_targets.append(data['targets'].detach().cpu().numpy())
             all_losses.append(batch_loss.detach().cpu().item())
             tk0.set_postfix(loss=np.array(all_losses).mean(), stage="train", epoch=self.current_epoch)
-            # if batch_id == 50:
-            #     break
         tk0.close()
 
         # compute metrics
@@ -510,6 +588,7 @@ class Trainer:
         model_dict['validation_batch_size'] = self.validation_batch_size
         model_dict['experiment_id'] = self.experiment_id
         model_dict['device'] = self.device
+        model_dict['accumulate_grad_steps'] = self.accumulate_grad_steps
         torch.save(model_dict, model_path)
     
     def load(self, model_path, device=None):
@@ -524,9 +603,12 @@ class Trainer:
             self.optimizer.load_state_dict(checkpoint['optimizer'])
         if self.scheduler:
             self.scheduler.load_state_dict(checkpoint['scheduler'])
-        self.current_epoch = checkpoint['epoch']
         self.fp16 = checkpoint['fp16']
         self.lr = checkpoint['lr']
+        self.current_epoch = checkpoint['current_epoch']
+        self.current_train_batch = checkpoint['current_train_batch']
+        self.step_scheduler_after = checkpoint['step_scheduler_after']
+        self.step_scheduler_metric = checkpoint['step_scheduler_metric']
         self.metrics = checkpoint['metrics']
         self._best_score = checkpoint['best_score']
         self._patience = checkpoint['patience']
@@ -534,6 +616,12 @@ class Trainer:
         self.train_batch_size = checkpoint['train_batch_size']
         self.validation_batch_size = checkpoint['validation_batch_size']
         self.experiment_id = checkpoint['experiment_id']
+        self.device = checkpoint['device']
+        self.accumulate_grad_steps = checkpoint['accumulate_grad_steps']
+    
+    def stoping_criteria(self):
+        """define training stoping criteria here"""
+        pass
     
     def predict(self, test_batch_size=64, device='cuda', load=False, model_path=None, dataloader_num_workers=4, save_prediction=True):
         """make predictions on test images"""
@@ -570,23 +658,23 @@ class Trainer:
         tk0.close()
         return predictions
 
-    def fit(self,
-            n_epochs=100, 
-            lr=1e-4, 
-            step_scheduler_after='epoch', 
-            step_scheduler_metric='val_auc',
-            device='cuda', 
-            fp16=False,
-            train_batch_size = 64,
-            validation_batch_size=64,
-            dataloader_shuffle=True,
-            dataloader_num_workers=4,
-            tensorboard_writer = None,
-            es_delta=1e-4,
-            es_patience=5,
+    def fit(self, 
+            max_epoch,
+            lr,
+            step_scheduler_after, 
+            step_scheduler_metric,
+            device,
+            fp16,
+            train_batch_size,
+            validation_batch_size,
+            dataloader_shuffle,
+            dataloader_num_workers,
+            es_delta,
+            es_patience,
+            accumulate_grad_steps,
            ):
         """fit method to train the model"""
-        self.n_epochs = n_epochs
+        self.max_epoch = max_epoch
         self.step_scheduler_after = step_scheduler_after
         self.step_scheduler_metric = step_scheduler_metric 
         self.device = device
@@ -594,12 +682,12 @@ class Trainer:
         self.lr = lr
         self._delta = es_delta
         self._patience = es_patience
-        # self.experiment_id = experiment_id
         self.train_batch_size = train_batch_size
         self.validation_batch_size = validation_batch_size
+        self.accumulate_grad_steps = accumulate_grad_steps
         self.configure_trainer()
-        # self.set_params(**kwargs)
-        for i in range(1, self.n_epochs+1):
+
+        for i in range(1, self.max_epoch+1):
             self.current_epoch = i
             # train
             train_dataloader = self.data_module.get_train_dataloader(
@@ -607,8 +695,8 @@ class Trainer:
                 shuffle=dataloader_shuffle, 
                 num_workers=dataloader_num_workers,
                 pin_memory=True)
-            self.train_one_epoch(train_dataloader)
             neptune.log_metric("optimizer_epoch_lr", self.optimizer.param_groups[0]['lr'])
+            self.train_one_epoch(train_dataloader)
             # validate 
             validation_dataloader = self.data_module.get_valid_dataloader(
                 batch_size=validation_batch_size, 
@@ -626,13 +714,21 @@ class Trainer:
                         neptune.log_metric('scheduler_epoch_lr', self.scheduler.get_last_lr()[0])
                         self.scheduler.step()
 
-            if self.current_epoch == 14:
-                self.save_checkpoint()
-                break
-            es_flag = self.early_stoping()
+            # if self.current_epoch == 14:
+            #     self.save_checkpoint()
+            #     break
+            # es_flag = self.early_stoping()
             # if es_flag:
             #     print(f"early stopping at epoch={i} out of {n_epochs}")
             #     break
+            # stoping criteria
+            try:
+                self.stoping_criteria()
+            except Exception:
+                # backward all the accumulate gradients
+                print(f"stoped training at {self.current_epoch} epoch")
+                break
+    
 
 def run(fold, resize=False, **kwargs):
     """train single fold classifier"""
@@ -752,7 +848,21 @@ def run(fold, resize=False, **kwargs):
     model = EfficientNetModel(pretrained=True)
     data_module = DataModule(train_dataset, valid_dataset, test_dataset)
     trainer = Trainer(model, data_module, f"{experiment_id}")
-    trainer.fit(**kwargs)
+    trainer.fit(
+        max_epoch=ConfigEnum.max_epoch.value,
+        lr=ConfigEnum.lr,
+        step_scheduler_after=ConfigEnum.step_scheduler_after, 
+        step_scheduler_metric=ConfigEnum.step_scheduler_metric,
+        device=ConfigEnum.device,
+        fp16=ConfigEnum.fp16,
+        train_batch_size=ConfigEnum.train_batch_size,
+        validation_batch_size=ConfigEnum.vaid_batch_size,
+        dataloader_shuffle=ConfigEnum.train_dataloder_shuffle,
+        dataloader_num_workers=ConfigEnum.dataloader_num_workers,
+        es_delta=ConfigEnum.es_delta,
+        es_patience=ConfigEnum.es_patience,
+        accumulate_grad_steps=ConfigEnum.accumulate_grad_steps,
+    )
 
 def ensemble_models(model_paths, output_file, model_tag):
     """combine different models to create the ensemble"""
