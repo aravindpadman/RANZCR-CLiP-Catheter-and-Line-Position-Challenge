@@ -39,7 +39,7 @@ from efficientnet_pytorch import EfficientNet
 
 import cv2
 import PIL
-urom PIL import Image
+from PIL import Image
 from PIL import ImageFile
 
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
@@ -284,8 +284,7 @@ class ConfigEnum(Enum):
     # optimizer related params
     optimizer_type = "Adam"
     optimizer_params = {'Adam': {
-                                'lr': 1e-4, 
-                                'eta_min': 3e-5, 
+                                'lr': 4e-4, 
                                 'betas':(0.9, 0.999), 
                                 'eps': 1e-08, 
                                 'weight_decay':0, 
@@ -295,12 +294,19 @@ class ConfigEnum(Enum):
     # scheduler related params
     scheduler_type = "CosineAnnealingWarmRestarts"
     scheduler_params = {'CosineAnnealingWarmRestarts': {
-                                                    'T_0': 2, 
-                                                    'T_mult': 2, 
-                                                    'eta_min': 3e-5, 
-                                                    'last_epoch': -1, 
-                                                    'verbose': False
-                                                },
+                                                'T_0': 1, 
+                                                'T_mult': 2, 
+                                                'eta_min': 1e-4, 
+                                                'last_epoch': -1, 
+                                                'verbose': False
+                                            },
+                        'CyclicLR': {
+                            'base_lr': 1e-8, 
+                            'max_lr': 1e-3, 
+                            'step_size_up': 10,
+                            'step_size_down': None,
+                            'cycle_momentum': False,
+                                },
                             }
     step_scheduler_after = 'batch'
     step_scheduler_metric = None
@@ -309,14 +315,25 @@ class ConfigEnum(Enum):
     compute_train_metric_after = 'epoch'
     compute_valid_loss_after = 'batch'
     compute_valid_metric_after = 'epoch'
-    # training stoping criteria
-    training_stoping_criteria = 'SGDR_ensemble'
-    stoping_criteria_params = {'early_stoping': {'patience': 5, 'delta': 1e-4},
-                                'SGDR_ensemble': {'N': 3, 'M':3,},
+    # training stopping criteria
+    training_stopping_criteria = 'SGDR_ensemble'
+    stopping_criteria_params = {'early_stopping': {'patience': 5, 'delta': 1e-4},
+                                'SGDR_ensemble': {'N': 5, 'M':5,},
+                                'max_epoch': {'max_epoch': 10,},
                                 }
     max_epoch = 100
-    train_dataloder_shuffle = True
+    train_dataloader_shuffle = True
     dataloader_num_workers = 5
+    # test time augmentation
+    TTA = False
+    TTA_params = {}
+    # train on complete data
+    train_on_all_data = True
+    # validate after epoch or batch
+    validate_after = 'epoch'
+    validation_steps = None
+    # lr range test
+    run_lr_range_test = False
 
 class Trainer:
     def __init__(self, 
@@ -344,13 +361,18 @@ class Trainer:
     compute_train_metric_after=None,
     compute_valid_loss_after=None,
     compute_valid_metric_after=None,
-    training_stoping_criteria=None,
-    stoping_criteria_params=None,
+    training_stopping_criteria=None,
+    stopping_criteria_params=None,
     max_epoch=None,
+    train_on_all_data=None,
+    validate_after=None,
+    validation_steps=None,
+    run_lr_range_test=None,
     ):
         self.model = model
         self.data_module = data_module
         self.experiment_id = experiment_id
+        self.experiment_tag = experiment_tag
 
         self.image_size = image_size
         self.device = device
@@ -380,9 +402,12 @@ class Trainer:
         self.compute_valid_loss_after = compute_valid_loss_after
         self.compute_valid_metric_after = compute_valid_metric_after
 
-        self.training_stoping_criteria = training_stoping_criteria
-        self.stoping_criteria_params = stoping_criteria_params
+        self.training_stopping_criteria = training_stopping_criteria
+        self.stopping_criteria_params = stopping_criteria_params
         self.max_epoch = max_epoch
+        self.train_on_all_data = train_on_all_data
+        self.run_lr_range_test = run_lr_range_test
+
         self._best_score = -np.inf
         self._current_score = None
         self._counter = 0
@@ -398,13 +423,17 @@ class Trainer:
         self.num_train_samples = None
         self.num_train_iterations = None
 
+        
+        self.validate_after = validate_after
+        self.validation_steps = validation_steps
+
+        # SGDR checkpoint count
+        self.checkpoint_snapshot = 1
         # configure trainer 
         self.configure_trainer()
         
     def configure_trainer(self):
-        self.configure_optimizers()
-        self.configure_schedulers()
-        
+        """configure trainer here"""
         if next(self.model.parameters()).device != self.device:
             self.model.to(self.device)
             
@@ -415,13 +444,19 @@ class Trainer:
         self.num_train_iterations = np.ceil(self.num_train_samples/self.train_batch_size)
         print(f"number of train iterations={self.num_train_iterations}")
 
-        
         if self.step_scheduler_after == 'batch':
             if self.scheduler_type == 'CosineAnnealingWarmRestarts':
-                self.scheduler_params['T_0'] = self.num_train_iterations*self.scheduler_params['T_0']
+                self.scheduler_params['T_0'] = int(self.num_train_iterations*self.scheduler_params['T_0'])
                 print(f"scheduler params re-adjusted to {self.scheduler_params}")
             elif self.scheduler_type == "CosineAnnealingLR":
                 raise NotImplementedError
+            elif self.scheduler_type == 'CyclicLR':
+                self.scheduler_params['step_size_up'] = int(self.num_train_iterations*self.scheduler_params['step_size_up'])
+                print(f"scheduler params re-adjusted to {self.scheduler_params}")
+
+
+        self.configure_optimizers()
+        self.configure_schedulers()
             
     def configure_optimizers(self):
         """configure optimizer here"""
@@ -431,8 +466,8 @@ class Trainer:
             self.optimizer = torch.optim.SGD(self.model.parameters(), **self.optimizer_params) 
         elif self.optimizer_type == 'RMSprop':
             self.optimizer = torch.optim.RMSprop(self.model.parameters(), **self.optimizer_params) 
-        else:
-            raise Exception("No optimizer configured for training")
+        else:                
+            self.optimizer = None
     
     def configure_schedulers(self, **kwargs):
         """configure different learning rate scheduler here"""
@@ -440,6 +475,8 @@ class Trainer:
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, **self.scheduler_params)
         elif self.scheduler_type == 'CosineAnnealingLR':
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, **self.scheduler_params)
+        elif self.scheduler_type == 'CyclicLR':
+            self.scheduler = torch.optim.lr_scheduler.CyclicLR(self.optimizer, **self.scheduler_params)
         else:
             self.scheduler = None
         
@@ -477,6 +514,7 @@ class Trainer:
         
     
     def train_one_batch(self, data):
+        self.model.train()
         self.current_train_batch += 1
         output, loss = self.model_forward_pass(data)
         with torch.set_grad_enabled(True):
@@ -493,20 +531,20 @@ class Trainer:
             if self.scheduler:
                 if self.step_scheduler_after == "batch":
                     if self.step_scheduler_metric is None:
-                        neptune.log_metric('batch_learning_rate', self.scheduler.get_last_lr()[0])
+                        neptune.log_metric('learning_rate_vs_batch', self.scheduler.get_last_lr()[0])
                         self.scheduler.step()
                     else:
                         pass
                         # step_metric = self.metrics['valid']
                         # self.scheduler.step(step_metric)
-        neptune.log_metric("train_batch_loss", loss)
-        neptune.log_metric("optimizer_batch_lr", self.optimizer.param_groups[0]['lr'])
-        if self.scheduler:
-            neptune.log_metric("scheduler_batch_lr", self.scheduler.get_last_lr()[0])
+        neptune.log_metric("train_batch_loss", loss.detach().cpu())
+        if self.run_lr_range_test:
+            neptune.log_metric('train_batch_loss_vs_LR',
+             self.scheduler.get_last_lr()[0], y=loss.detach().cpu())
+
         return output, loss
         
     def train_one_epoch(self, dataloader):
-        self.model.train()
         all_outputs = []
         all_targets = []
         all_losses = []
@@ -517,6 +555,17 @@ class Trainer:
             all_targets.append(data['targets'].detach().cpu().numpy())
             all_losses.append(batch_loss.detach().cpu().item())
             tk0.set_postfix(loss=np.array(all_losses).mean(), stage="train", epoch=self.current_epoch)
+
+            if self.validate_after == 'batch' and self.train_on_all_data == False:
+                if (self.current_train_batch % self.validation_steps) == 0:
+                    validation_dataloader = self.data_module.get_valid_dataloader(
+                            batch_size=self.valid_batch_size, 
+                            shuffle=self.train_dataloader_shuffle, 
+                            num_workers=self.dataloader_num_workers, 
+                            pin_memory=True
+                        )
+                    self.validate_one_epoch(validation_dataloader)
+                
         tk0.close()
 
         # compute metrics
@@ -526,13 +575,14 @@ class Trainer:
         self.metrics['train'].append({'epoch': self.current_epoch, 
         'avg_loss': avg_loss, 'auc_score': avg_auc})
         neptune.log_metric("train_epoch_loss", avg_loss)
-        neptune.log_metric("train_epoch_auc", avg_auc)
+        neptune.log_metric("train_epoch_AUC", avg_auc)
         print(self.metrics['train'][self.current_epoch -1])
     
     def validate_one_batch(self, data):
         self.current_valid_batch += 1
-        output, loss = self.model_forward_pass(data)
-        neptune.log_metric("valid_batch_loss", loss.detach().cpu())
+        with torch.no_grad():
+            output, loss = self.model_forward_pass(data)
+        neptune.log_metric("validation_batch_loss", loss.detach().cpu())
         return output, loss
  
 
@@ -553,15 +603,26 @@ class Trainer:
         avg_loss = np.array(all_losses).mean()
         self.metrics['valid'].append({'epoch': self.current_epoch, 
         'avg_loss': avg_loss, 'auc_score': avg_auc})
-        neptune.log_metric("valid_epoch_loss", avg_loss)
-        neptune.log_metric("valid_epoch_auc", avg_auc)
         print(self.metrics['valid'][-1])
+        if self.run_lr_range_test:
+            # loss
+            neptune.log_metric('validation_steps_end_loss_vs_LR',
+            self.scheduler.get_last_lr()[0], y=avg_loss)
+            # AUC
+            neptune.log_metric('validation_steps_end_AUC_vs_LR',
+            self.scheduler.get_last_lr()[0], y=avg_auc)
+            # validation steps end loss and AUC
+            neptune.log_metric("validation_steps_end_loss", avg_loss)
+            neptune.log_metric("validation_steps_end_AUC", avg_auc)
+        else:
+            neptune.log_metric("validation_epoch_loss", avg_loss)
+            neptune.log_metric("validation_epoch_AUC", avg_auc)
     
-    def early_stoping(self):
-        """early stoping function"""
+    def early_stopping(self):
+        """early stopping function"""
         self._current_score = self.metrics['valid'][-1]['auc_score']
-        delta = self.stoping_criteria_params['delta']
-        patience = self.stoping_criteria_params['patience']
+        delta = self.stopping_criteria_params['delta']
+        patience = self.stopping_criteria_params['patience']
         if (self._current_score - self._best_score) > self._delta:
             self._best_score = self._current_score
             self._counter = 0
@@ -591,69 +652,150 @@ class Trainer:
             sch_state_dict = self.scheduler.state_dict()
         else:
             sch_state_dict = None
+        
+        if self.scaler is not None:
+            amp_grad_scaler = self.scaler.state_dict()
+        else:
+            amp_grad_scaler = None
+
         model_dict = {}
         model_dict["state_dict"] = model_state_dict
         model_dict["optimizer"] = opt_state_dict
         model_dict["scheduler"] = sch_state_dict
-        model_dict["fp16"] = self.fp16
-        model_dict['lr'] = self.lr
-        model_dict['current_epoch'] = self.current_epoch
-        model_dict['current_train_batch'] = self.current_train_batch
+        model_dict['scaler'] = amp_grad_scaler
+        model_dict['image_size'] = self.image_size
+        model_dict['device'] = self.device
+        model_dict['fp16'] = self.fp16
+        model_dict['accumulate_grad_steps'] = self.accumulate_grad_steps
+
+        model_dict['experiment_id'] = self.experiment_id
+        model_dict['experiment_tag'] = self.experiment_tag
+
+        model_dict['seed'] = self.seed
+
+        model_dict['train_batch_size'] = self.train_batch_size
+        model_dict['valid_batch_size'] = self.valid_batch_size
+        model_dict['test_batch_size'] = self.test_batch_size
+        model_dict['dataloader_num_workers'] = self.dataloader_num_workers
+        model_dict['train_dataloader_shuffle'] = self.train_dataloader_shuffle
+
+        model_dict['optimizer_type'] = self.optimizer_type
+        model_dict['optimizer_params'] = self.optimizer_params
+
+        model_dict['scheduler_type'] = self.scheduler_type
+        model_dict['scheduler_params'] = self.scheduler_params
         model_dict['step_scheduler_after'] = self.step_scheduler_after
         model_dict['step_scheduler_metric'] = self.step_scheduler_metric
+
+        model_dict['compute_train_loss_after'] = self.compute_train_loss_after
+        model_dict['compute_train_metric_after'] = self.compute_train_metric_after
+        model_dict['compute_valid_loss_after'] = self.compute_valid_loss_after
+        model_dict['compute_valid_metric_after'] = self.compute_valid_metric_after
+
+        model_dict['training_stopping_criteria'] = self.training_stopping_criteria
+        model_dict['stopping_criteria_params'] = self.stopping_criteria_params
+        model_dict['max_epoch'] = self.max_epoch
+        model_dict['train_on_all_data'] = self.train_on_all_data
+        model_dict['validate_after'] = self.validate_after
+        model_dict['validation_steps'] = self.validation_steps
+        model_dict['run_lr_range_test'] = self.run_lr_range_test
+
+        model_dict['_best_score'] = self._best_score
+        model_dict['_current_score'] = self._current_score
+        model_dict['_counter'] = self._counter
+
         model_dict['metrics'] = self.metrics
-        model_dict['best_score'] = self._best_score
-        model_dict['patience'] = self._patience
-        model_dict['delta'] = self._delta
-        model_dict['train_batch_size'] = self.train_batch_size
-        model_dict['validation_batch_size'] = self.validation_batch_size
-        model_dict['experiment_id'] = self.experiment_id
-        model_dict['device'] = self.device
-        model_dict['accumulate_grad_steps'] = self.accumulate_grad_steps
+        model_dict['current_epoch'] = self.current_epoch
+        model_dict['current_train_batch'] = self.current_train_batch
+        model_dict['current_valid_batch'] = self.current_valid_batch
+
+        model_dict['num_train_samples'] = self.num_train_samples
+        model_dict['num_train_iterations'] = self.num_train_iterations
         torch.save(model_dict, model_path)
     
-    def load(self, model_path, device=None):
+    def load(self, model_path):
         """Load the saved model to resume training and inference"""
         # TODO: include new params based on ConfigEnum
-        if device:
-            self.device = device
         checkpoint = torch.load(model_path)
+
+        self.image_size = checkpoint['image_size']
+        self.device = checkpoint['device']
+        self.fp16 = checkpoint['fp16']
+        self.accumulate_grad_steps = checkpoint['accumulate_grad_steps']
+        self.experiment_id = checkpoint['experiment_id']
+        self.experiment_tag = checkpoint['experiment_tag']
+        self.seed = checkpoint['seed']
+        self.train_batch_size = checkpoint['train_batch_size']
+        self.valid_batch_size = checkpoint['valid_batch_size']
+        self.test_batch_size = checkpoint['test_batch_size']
+        self.dataloader_num_workers = checkpoint['dataloader_num_workers']
+        self.train_dataloader_shuffle = checkpoint['train_dataloader_shuffle']
+        self.optimizer_type = checkpoint['optimizer_type']
+        self.optimizer_params = checkpoint['optimizer_params']
+        self.scheduler_type = checkpoint['scheduler_type']
+        self.scheduler_params = checkpoint['scheduler_params']
+        self.step_scheduler_after = checkpoint['step_scheduler_after']
+        self.step_scheduler_metric = checkpoint['step_scheduler_metric']
+        self.compute_train_loss_after = checkpoint['compute_train_loss_after']
+        self.compute_train_metric_after = checkpoint['compute_train_metric_after']
+        self.compute_valid_loss_after = checkpoint['compute_valid_loss_after']
+        self.compute_valid_metric_after = checkpoint['compute_valid_metric_after']
+        self.training_stopping_criteria = checkpoint['training_stopping_criteria']
+        self.stopping_criteria_params = checkpoint['stopping_criteria_params']
+        self.max_epoch = checkpoint['max_epoch']
+        self.train_on_all_data = checkpoint['train_on_all_data']
+        self.validate_after = checkpoint['validate_after']
+        self.validation_steps = checkpoint['validation_steps']
+        self.run_lr_range_test= checkpoint['run_lr_range_test']
+        self._best_score = checkpoint['_best_score']
+        self._current_score = checkpoint['_current_score']
+        self._counter = checkpoint['_counter']
+        self.metrics = checkpoint['metrics']
+        self.current_epoch = checkpoint['current_epoch']
+        self.current_train_batch = checkpoint['current_train_batch']
+        self.current_valid_batch = checkpoint['current_valid_batch']
+        self.num_train_samples = checkpoint['num_train_samples']
+        self.num_train_iterations = checkpoint['num_train_iterations']
+
+        # initialize optimizer, scheduler, and gradient scaler
+        self.configure_optimizers()
+        self.configure_schedulers()
+        
+        if self.fp16:
+            self.scaler = torch.cuda.amp.GradScaler()
+
         if self.model:
             self.model.load_state_dict(checkpoint['state_dict'])
             self.model.to(self.device)
+
         if self.optimizer:
             self.optimizer.load_state_dict(checkpoint['optimizer'])
+
         if self.scheduler:
             self.scheduler.load_state_dict(checkpoint['scheduler'])
-        self.fp16 = checkpoint['fp16']
-        self.lr = checkpoint['lr']
-        self.current_epoch = checkpoint['current_epoch']
-        self.current_train_batch = checkpoint['current_train_batch']
-        self.step_scheduler_after = checkpoint['step_scheduler_after']
-        self.step_scheduler_metric = checkpoint['step_scheduler_metric']
-        self.metrics = checkpoint['metrics']
-        self._best_score = checkpoint['best_score']
-        self._patience = checkpoint['patience']
-        self._delta = checkpoint['delta']
-        self.train_batch_size = checkpoint['train_batch_size']
-        self.validation_batch_size = checkpoint['validation_batch_size']
-        self.experiment_id = checkpoint['experiment_id']
-        self.device = checkpoint['device']
-        self.accumulate_grad_steps = checkpoint['accumulate_grad_steps']
+
+        if self.scaler:
+            self.scaler.load_state_dict(checkpoint['scaler'])
     
-    def stoping_criteria(self):
-        """define training stoping criteria here"""
+    def stopping_criteria(self):
+        """define training stopping criteria here"""
         stop_training = False
-        self.checkpoint_snapshot = 1
-        if self.training_stoping_criteria == "early_stoping":
-            stop_training = self.early_stoping()
-        elif self.training_stoping_criteria == 'SGDR_ensemble':
+        if self.training_stopping_criteria == "early_stopping":
+            stop_training = self.early_stopping()
+        elif self.training_stopping_criteria == 'SGDR_ensemble':
             T_0 = self.scheduler_params['T_0']
+            if self.step_scheduler_after == 'batch':
+                T_0 = T_0/self.num_train_iterations
+                print(f"sgdr T_0={T_0}")
+
             T_mult = self.scheduler_params['T_mult']
-            N = self.stoping_criteria_params['N']
-            M = self.stoping_criteria_params['M']
-            possible_epoch = [T_0*(T_mult**i) for i in range(N)] 
+            N = self.stopping_criteria_params['N']
+            M = self.stopping_criteria_params['M']
+            possible_epoch = [T_0*math.pow(T_mult, i) for i in range(N)] 
+            possible_epoch = np.cumsum(possible_epoch)
             snapshot_epochs = possible_epoch[-M:]
+            print(snapshot_epochs)
+
             if self.current_epoch in snapshot_epochs:
                 print("warm restarted learning rate")
                 print(f"saving model={self.checkpoint_snapshot} out of {M}")
@@ -661,8 +803,15 @@ class Trainer:
                 f"{self.experiment_tag}_snapshot_{self.checkpoint_snapshot}_epoch_{self.current_epoch}.pth")
                 self.checkpoint_snapshot += 1
                 self.save_checkpoint(model_path=model_path)
+
             if self.current_epoch == possible_epoch[-1]:
                 stop_training = True
+
+        elif self.training_stopping_criteria == "max_epoch":
+            if self.current_epoch == self.stopping_criteria_params['max_epoch']: 
+                stop_training = True
+                self.save_checkpoint()
+            
         return stop_training
             
     
@@ -703,45 +852,56 @@ class Trainer:
 
     def fit(self):
         """fit method to train the model"""
-        for i in range(1, self.max_epoch+1):
-            self.current_epoch = i
+        for i in range(self.current_epoch, self.max_epoch):
+            self.current_epoch += 1
             # train
             train_dataloader = self.data_module.get_train_dataloader(
                     batch_size=self.train_batch_size, 
-                    shuffle=self.dataloader_shuffle, 
+                    shuffle=self.train_dataloader_shuffle, 
                     num_workers=self.dataloader_num_workers,
                     pin_memory=True
                 )
-            neptune.log_metric("optimizer_epoch_lr", self.optimizer.param_groups[0]['lr'])
+            neptune.log_metric("learning_rate_vs_epoch", self.optimizer.param_groups[0]['lr'])
             self.train_one_epoch(train_dataloader)
 
             # validate 
-            validation_dataloader = self.data_module.get_valid_dataloader(
-                    batch_size=self.validation_batch_size, 
-                    shuffle=self.dataloader_shuffle, 
-                    num_workers=self.dataloader_num_workers, 
-                    pin_memory=True
-                )
-            self.validate_one_epoch(validation_dataloader)
+            if self.validate_after == 'epoch' and self.train_on_all_data == False and self.run_lr_range_test == False:
+                validation_dataloader = self.data_module.get_valid_dataloader(
+                        batch_size=self.valid_batch_size, 
+                        shuffle=self.train_dataloader_shuffle, 
+                        num_workers=self.dataloader_num_workers, 
+                        pin_memory=True
+                    )
+                self.validate_one_epoch(validation_dataloader)
 
             if self.scheduler:
                 if self.step_scheduler_after == 'epoch': 
                     if self.step_scheduler_metric == 'val_auc':
-                        neptune.log_metric('scheduler_epoch_lr', self.scheduler.get_last_lr()[0])
                         self.scheduler.step(self.metrics['valid'][-1]['auc_score'])
                     else:
-                        neptune.log_metric('scheduler_epoch_lr', self.scheduler.get_last_lr()[0])
                         self.scheduler.step()
 
-            try:
-                self.stoping_criteria()
-            except Exception:
+            if self.run_lr_range_test:
+                    neptune.log_metric('validation_epoch_end_AUC_vs_LR', 
+                    self.scheduler.get_last_lr()[0], y=self.metrics['valid'][-1]['auc_score'])
+
+            stop_training = self.stopping_criteria()
+            if stop_training:
                 # backward all the accumulate gradients
                 print(f"stoped training at {self.current_epoch} epoch")
                 break
+
+    def resume_training(self, model_path=None):
+        """resuming training"""
+        if model_path is None:
+            model_path = os.path.join(path_checkpoints_dir, f"{self.experiment_id}.pth")
+        self.load(model_path)
+        print(f"resuming training from epoch={self.current_epoch}")
+        self.fit()
+            
     
 
-def run(fold, resize=False):
+def run(fold=None, resize=False):
     """train single fold classifier"""
     experiment_tag = "000_008"
     experiment_id = f"{experiment_tag}_{fold}"
@@ -752,8 +912,8 @@ def run(fold, resize=False):
             parameters['optimizer_params'] = i.value[ConfigEnum.optimizer_type.value]
         elif i.name == 'scheduler_params':
             parameters['scheduler_params'] = i.value[ConfigEnum.scheduler_type.value]
-        elif i.name == 'stoping_criteria_params':
-            parameters['stoping_criteria_params'] = i.value[ConfigEnum.training_stoping_criteria.value]
+        elif i.name == 'stopping_criteria_params':
+            parameters['stopping_criteria_params'] = i.value[ConfigEnum.training_stopping_criteria.value]
         else:
             parameters[i.name] = i.value
     parameters['experiment_id'] = experiment_id
@@ -764,7 +924,7 @@ def run(fold, resize=False):
     neptune.append_tag(experiment_tag)
     neptune.append_tag(parameters['optimizer_type'])
     neptune.append_tag(parameters['scheduler_type'])
-    neptune.append_tag(parameters['training_stoping_criteria'])
+    neptune.append_tag(parameters['training_stopping_criteria'])
 
     if os.path.isfile(os.path.join(path_train_folds_dir, 'train_folds.csv')):
         train = pd.read_csv(os.path.join(path_train_folds_dir, 'train_folds.csv'))
@@ -774,13 +934,16 @@ def run(fold, resize=False):
         train.to_csv(os.path.join(path_train_folds_dir, 'train_folds.csv'), index=False)
         print("train folds csv saved to disk for reuse")
 
-    create_folds_count = train.groupby('kfold').StudyInstanceUID.count()
-    print(create_folds_count)
-
     if resize:
         resize_image_batch(path_train_dir, path_resized_train_image_dir, IMAGE_SIZE)
 
-    valid = train.loc[train.kfold == fold].reset_index(drop=True)
+    # do not split the data into CV folds if train_on_all_data fold is True
+    # create dummy validation data instead
+    if ConfigEnum.train_on_all_data.value == True:
+        valid = pd.DataFrame(columns=train.columns)
+    else:
+        valid = train.loc[train.kfold == fold].reset_index(drop=True)
+
     train = train.loc[train.kfold != fold].reset_index(drop=True)
 
     # image path for torch dataset
@@ -839,7 +1002,7 @@ def run(fold, resize=False):
         path_train_images,  
         targets_train,  
         augmentations=train_augmentation,  
-        backend=IMAGE_BACKEND,  
+        backend=ConfigEnum.image_backend.value,  
         channel_first=True,  
         grayscale=True,  
         grayscale_as_rgb=True,
@@ -849,7 +1012,7 @@ def run(fold, resize=False):
         path_valid_images,  
         targets_valid,  
         augmentations=valid_augmentation,  
-        backend=IMAGE_BACKEND,  
+        backend=ConfigEnum.image_backend.value,  
         channel_first=True,  
         grayscale=True,  
         grayscale_as_rgb=True,
@@ -859,15 +1022,14 @@ def run(fold, resize=False):
         path_test_images,  
         None,  
         augmentations=test_augmentation,  
-        backend=ConfigEnum.image_backend,  
+        backend=ConfigEnum.image_backend.value,  
         channel_first=True,  
         grayscale=True,  
         grayscale_as_rgb=True,
     )
 
-    # preprocess and distribute all neccessary params to respective modules
-
-    model = EfficientNetModel(pretrained=True, backbone=ConfigEnum.model_backbone)
+    # preproccess and distribute all necessary params to respective modules
+    model = EfficientNetModel(pretrained=True, backbone=ConfigEnum.model_backbone.value)
     data_module = DataModule(train_dataset, valid_dataset, test_dataset)
     trainer = Trainer(model, data_module, 
         experiment_id=parameters['experiment_id'],
@@ -892,11 +1054,17 @@ def run(fold, resize=False):
         compute_train_metric_after=ConfigEnum.compute_train_metric_after.value,
         compute_valid_loss_after=ConfigEnum.compute_valid_loss_after.value,
         compute_valid_metric_after=ConfigEnum.compute_valid_metric_after.value,
-        training_stoping_criteria=ConfigEnum.training_stoping_criteria,
-        stoping_criteria_params =parameters['stoping_criteria_params'],
+        training_stopping_criteria=ConfigEnum.training_stopping_criteria.value,
+        stopping_criteria_params =parameters['stopping_criteria_params'],
         max_epoch=ConfigEnum.max_epoch.value,
+        train_on_all_data=ConfigEnum.train_on_all_data.value,
+        validate_after=ConfigEnum.validate_after.value,
+        validation_steps=ConfigEnum.validation_steps.value,
+        run_lr_range_test=ConfigEnum.run_lr_range_test.value,
     )
     trainer.fit()
+    # model_path = "/home/welcome/github/ranzcr/checkpoints/000_008_snapshot_1_epoch_1.pth"
+    # trainer.resume_training(model_path)
 
 
 def ensemble_models(model_paths, output_file, model_tag):
@@ -934,17 +1102,18 @@ if __name__ == '__main__':
     # model_paths = [os.path.join(path_checkpoints_dir, mpath) for mpath in model_paths]
     # ensemble_models(model_paths, "000_002_all_folds.csv")
     # print("done")
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument("--fold", required=True, type=int)
-    # parser.add_argument("--resize", type=bool, required=False, default=False)
-    # parser.add_argument("--sleep", type=bool, required=False, default=False)
-    # args = vars(parser.parse_args())
-    # print(args)
-    # fold = args['fold']
-    # resize = args['resize']
-    # sleep = args['sleep']
-    # if sleep:
-    #     print("START SLEEP")
-    #     time.sleep(5*60)
-    fold = 0
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fold", required=False, type=int, default=None)
+    parser.add_argument("--resize", type=bool, required=False, default=False)
+    parser.add_argument("--sleep", type=bool, required=False, default=False)
+    args = vars(parser.parse_args())
+    print(args)
+    fold = args['fold']
+    resize = args['resize']
+    sleep = args['sleep']
+    if sleep:
+        print("START SLEEP")
+        time.sleep(5*60)
     run(fold)
+
+# %%
