@@ -742,6 +742,7 @@ class Trainer:
 
         model_dict['num_train_samples'] = self.num_train_samples
         model_dict['num_train_iterations'] = self.num_train_iterations
+        model_dict['checkpoint_snapshot'] = self.checkpoint_snapshot  
         torch.save(model_dict, model_path)
     
     def load(self, model_path):
@@ -791,6 +792,7 @@ class Trainer:
         self.current_valid_batch = checkpoint['current_valid_batch']
         self.num_train_samples = checkpoint['num_train_samples']
         self.num_train_iterations = checkpoint['num_train_iterations']
+        self.checkpoint_snapshot = checkpoint['checkpoint_snapshot']  
 
         # initialize optimizer, scheduler, and gradient scaler
         self.configure_optimizers()
@@ -926,7 +928,7 @@ class Trainer:
 
             # sleep the training process
             if self.current_epoch % self.sleep_in_epochs == 0:
-                print(f"SLEEPING FOR {self.sleep_time} at epoch={self.epoch}")
+                print(f"SLEEPING FOR {self.sleep_time} at epoch={self.current_epoch}")
                 for i in range(int(self.sleep_time/30)):
                     time.sleep(i)
                     neptune.log_metric("sleeping_status", y=1)
